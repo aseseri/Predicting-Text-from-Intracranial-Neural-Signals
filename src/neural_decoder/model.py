@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import math
 
 from .augmentations import GaussianSmoothing
 
@@ -55,6 +56,12 @@ class GRUDecoder(nn.Module):
             dropout=self.dropout,
             bidirectional=self.bidirectional,
         )
+
+        # --- Experiment 10 ---
+        # Initialize LayerNorm using size of the hidden state
+        norm_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        self.layer_norm = nn.LayerNorm(norm_dim)
+        # ------
 
         for name, param in self.gru_decoder.named_parameters():
             if "weight_hh" in name:
@@ -118,6 +125,82 @@ class GRUDecoder(nn.Module):
 
         hid, _ = self.gru_decoder(stridedInputs, h0.detach())
 
+        # --- Experiment 10 ---
+        hid = self.layer_norm(hid)
+        # ------
+
         # get seq
         seq_out = self.fc_decoder_out(hid)
         return seq_out
+
+
+# --- Experiment 3 ---
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+class TransformerDecoder(nn.Module):
+    def __init__(self, neural_dim, n_classes, hidden_dim, layer_dim, nDays=24, dropout=0.1, 
+                 strideLen=4, kernelLen=14, gaussianSmoothWidth=0, device='cuda', bidirectional=False):
+        super().__init__()
+        
+        # Keeps day-specific preprocessing
+        self.device = device
+        self.strideLen = strideLen
+        self.kernelLen = kernelLen
+        self.gaussianSmoothWidth = gaussianSmoothWidth
+        self.inputLayerNonlinearity = torch.nn.Softsign()
+        
+        # Same smoother and unfolder as baseline
+        self.gaussianSmoother = GaussianSmoothing(neural_dim, 20, self.gaussianSmoothWidth, dim=1)
+        self.unfolder = torch.nn.Unfold((self.kernelLen, 1), dilation=1, padding=0, stride=self.strideLen)
+        
+        # Same day weights as baseline
+        self.dayWeights = torch.nn.Parameter(torch.randn(nDays, neural_dim, neural_dim))
+        self.dayBias = torch.nn.Parameter(torch.zeros(nDays, 1, neural_dim))
+        for x in range(nDays):
+            self.dayWeights.data[x, :, :] = torch.eye(neural_dim)
+            
+        # --- Transformer ---
+        input_dim = neural_dim * kernelLen
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        
+        # Positional Encodings (for concept of order)
+        self.pos_encoder = PositionalEncoding(hidden_dim, dropout=dropout)
+        
+        # Encoder
+        encoder_layers = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=8, dim_feedforward=2048, dropout=dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=layer_dim)
+        
+        self.fc_decoder_out = nn.Linear(hidden_dim, n_classes + 1)
+
+    def forward(self, neuralInput, dayIdx):
+        neuralInput = torch.permute(neuralInput, (0, 2, 1))
+        neuralInput = self.gaussianSmoother(neuralInput)
+        neuralInput = torch.permute(neuralInput, (0, 2, 1))
+        
+        dayWeights = torch.index_select(self.dayWeights, 0, dayIdx)
+        transformedNeural = torch.einsum("btd,bdk->btk", neuralInput, dayWeights) + torch.index_select(self.dayBias, 0, dayIdx)
+        transformedNeural = self.inputLayerNonlinearity(transformedNeural)
+        
+        stridedInputs = torch.permute(self.unfolder(torch.unsqueeze(torch.permute(transformedNeural, (0, 2, 1)), 3)), (0, 2, 1))
+        
+        # --- Transformer  ---
+        src = self.input_proj(stridedInputs)
+        src = self.pos_encoder(src)
+        output = self.transformer_encoder(src)
+        
+        return self.fc_decoder_out(output)
+# -----
