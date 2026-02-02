@@ -89,3 +89,50 @@ class GaussianSmoothing(nn.Module):
             filtered (torch.Tensor): Filtered output.
         """
         return self.conv(input, weight=self.weight, groups=self.groups, padding="same")
+
+
+# --- Experiment 2 ---
+class TimeMasking(nn.Module): # Randomly masks groups of time in neural data
+    def __init__(self, mask_prob=0.1, max_mask_len=20):
+        super().__init__()
+        self.mask_prob = mask_prob
+        self.max_mask_len = max_mask_len
+
+    def forward(self, x):
+        if not self.training:
+            return x
+            
+        B, T, F = x.shape
+        mask = torch.ones_like(x)
+        
+        for b in range(B):
+            if torch.rand(1) < self.mask_prob:
+                mask_len = torch.randint(1, self.max_mask_len, (1,)).item()
+                start = torch.randint(0, T - mask_len, (1,)).item()
+                mask[b, start:start+mask_len, :] = 0
+                
+        return x * mask
+# ----
+
+# --- Experiment 7 ---
+class FeatureMasking(nn.Module):
+    def __init__(self, mask_prob=0.1, max_mask_len=10):
+        super().__init__()
+        self.mask_prob = mask_prob
+        self.max_mask_len = max_mask_len
+
+    def forward(self, x):
+        if not self.training: return x
+        
+        B, T, F = x.shape
+        mask = torch.ones_like(x)
+        
+        for b in range(B):
+            if torch.rand(1) < self.mask_prob:
+                mask_len = torch.randint(1, self.max_mask_len, (1,)).item()
+                # Chooses start index in Feature dimension (dim 2)
+                start = torch.randint(0, max(1, F - mask_len), (1,)).item()
+                mask[b, :, start:start+mask_len] = 0
+                
+        return x * mask
+# ----
