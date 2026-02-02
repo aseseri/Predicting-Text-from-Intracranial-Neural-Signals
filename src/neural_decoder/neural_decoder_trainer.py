@@ -9,8 +9,9 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 
-from .model import GRUDecoder
+from .model import GRUDecoder, TransformerDecoder
 from .dataset import SpeechDataset
+from .augmentations import GaussianSmoothing, TimeMasking, FeatureMasking
 
 
 def getDatasetLoaders(
@@ -69,6 +70,19 @@ def trainModel(args):
         args["batchSize"],
     )
 
+    # --- Experiment 3 ---
+    # model = TransformerDecoder(
+    #     neural_dim=args["nInputFeatures"],
+    #     n_classes=args["nClasses"],
+    #     hidden_dim=args["Transformer-hidden-nLayers"],
+    #     layer_dim=args["Transformer-nLayers"],
+    #     nDays=len(loadedData["train"]),
+    #     dropout=args["Transformer-dropout"],
+    #     device=device,
+    #     strideLen=args["strideLen"],
+    #     kernelLen=args["kernelLen"],
+    #     gaussianSmoothWidth=args["gaussianSmoothWidth"],
+    # ).to(device)
     model = GRUDecoder(
         neural_dim=args["nInputFeatures"],
         n_classes=args["nClasses"],
@@ -82,21 +96,59 @@ def trainModel(args):
         gaussianSmoothWidth=args["gaussianSmoothWidth"],
         bidirectional=args["bidirectional"],
     ).to(device)
+    # -----
+
+    # Adding to resume training from a checkpoint: checks if a specific checkpoint path was provided in args
+    if "checkpointPath" in args and args["checkpointPath"] and os.path.exists(args["checkpointPath"]):
+        print(f"Resuming from: {args['checkpointPath']}")
+        model.load_state_dict(torch.load(args["checkpointPath"]))
+    # -------
 
     loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-    optimizer = torch.optim.Adam(
+    
+    # --- Experiment 1 ---
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args["lrStart"],
         betas=(0.9, 0.999),
-        eps=0.1,
+        eps=0.01, # 0.1 to 0.01 for finer convergence
         weight_decay=args["l2_decay"],
     )
-    scheduler = torch.optim.lr_scheduler.LinearLR(
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        start_factor=1.0,
-        end_factor=args["lrEnd"] / args["lrStart"],
-        total_iters=args["nBatch"],
+        max_lr=args["lrStart"],
+        total_steps=args["nBatch"],
+        pct_start=0.3, # 30% of time warming up
+        anneal_strategy='cos',
     )
+    # ----------------------------------------
+
+    # --- Baseline ---
+    # loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+    # optimizer = torch.optim.Adam(
+    #     model.parameters(),
+    #     lr=args["lrStart"],
+    #     betas=(0.9, 0.999),
+    #     eps=0.1,
+    #     weight_decay=args["l2_decay"],
+    # )
+    # scheduler = torch.optim.lr_scheduler.LinearLR(
+    #     optimizer,
+    #     start_factor=1.0,
+    #     end_factor=args["lrEnd"] / args["lrStart"],
+    #     total_iters=args["nBatch"],
+    # )
+    # ---
+
+    # --- Experiment 2 ---
+    time_masker = TimeMasking(mask_prob=0.2, max_mask_len=30).to(device)
+    # ----
+    # --- Experiment 4 ---
+    # time_masker = TimeMasking(mask_prob=0.4, max_mask_len=40).to(device)
+    # ----
+    # --- Experiment 7 ---
+    # feat_masker = FeatureMasking(mask_prob=0.2, max_mask_len=20).to(device) 
+    # ----
 
     # --train--
     testLoss = []
@@ -114,6 +166,10 @@ def trainModel(args):
             dayIdx.to(device),
         )
 
+        # --- Experiment 9 ---
+        # X = torch.log1p(X - X.min() + 1e-6)
+        # ----
+
         # Noise augmentation is faster on GPU
         if args["whiteNoiseSD"] > 0:
             X += torch.randn(X.shape, device=device) * args["whiteNoiseSD"]
@@ -123,6 +179,12 @@ def trainModel(args):
                 torch.randn([X.shape[0], 1, X.shape[2]], device=device)
                 * args["constantOffsetSD"]
             )
+        # ---  Experiment 2 ---
+        X = time_masker(X)
+        # ------------------------------
+        # --- Experiment 7 ---
+        # X = feat_masker(X)
+        # -----
 
         # Compute prediction error
         pred = model.forward(X, dayIdx)
@@ -158,6 +220,9 @@ def trainModel(args):
                         y_len.to(device),
                         testDayIdx.to(device),
                     )
+                    # --- Experiment 9 ---
+                    # X = torch.log1p(X - X.min() + 1e-6)
+                    # ----
 
                     pred = model.forward(X, testDayIdx)
                     loss = loss_ctc(
@@ -231,6 +296,20 @@ def loadModel(modelDir, nInputLayers=24, device="cuda"):
         gaussianSmoothWidth=args["gaussianSmoothWidth"],
         bidirectional=args["bidirectional"],
     ).to(device)
+    # --- Experiment 3 ---
+    # model = TransformerDecoder(
+    #     neural_dim=args["nInputFeatures"],
+    #     n_classes=args["nClasses"],
+    #     hidden_dim=args["Transformer-hidden-nLayers"],
+    #     layer_dim=args["Transformer-nLayers"],
+    #     nDays=nInputLayers,
+    #     dropout=args["Transformer-dropout"],
+    #     device=device,
+    #     strideLen=args["strideLen"],
+    #     kernelLen=args["kernelLen"],
+    #     gaussianSmoothWidth=args["gaussianSmoothWidth"],
+    # ).to(device)
+    # -------
 
     model.load_state_dict(torch.load(modelWeightPath, map_location=device))
     return model
